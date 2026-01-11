@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tactica"
+version = "0.2.0"
+description = "GPU-accelerated camera/sensor placement optimization engine"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Tactica Team"}
+]
+keywords = [
+    "camera placement",
+    "optimization",
+    "visibility",
+    "GPU",
+    "CUDA",
+    "surveillance",
+    "sensor placement",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+dependencies = [
+    "numpy>=1.21.0",
+    "matplotlib>=3.5.0",
+    "torch>=2.0.0",
+    "scipy>=1.9.0",
+    "cma>=3.3.0",
+    "imageio>=2.31.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "websockets>=11.0",
+]
+geo = [
+    "rasterio>=1.3.0",
+    "pyproj>=3.4.0",
+]
+config = [
+    "pyyaml>=6.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black",
+    "isort",
+    "mypy",
+]
+all = [
+    "tactica[api,geo,config,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/tactica/tactica-optimization"
+Documentation = "https://github.com/tactica/tactica-optimization#readme"
+Repository = "https://github.com/tactica/tactica-optimization"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tactica*"]
+
+[tool.setuptools.package-data]
+"tactica.core.cuda" = ["*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
