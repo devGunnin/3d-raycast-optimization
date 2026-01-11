@@ -253,24 +253,32 @@ def run_indoor_demo(seed=123):
 def main():
     """Main demo entry point."""
     print("GPU Visibility Engine - Step 1 Demo")
-    print("Using CuPy RawKernel for CUDA computation\n")
+    print("Using PyTorch CUDA extension with custom .cu kernel\n")
 
     # Check CUDA availability
     try:
-        import cupy as cp
-        device = cp.cuda.Device()
-        print(f"CUDA Device: {device.id}")
-        print(f"Compute capability: {device.compute_capability}")
-        mem = device.mem_info
-        print(f"GPU Memory: {mem[1] / 1e9:.1f} GB total, {mem[0] / 1e9:.1f} GB free\n")
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available")
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
+        print(f"CUDA Device: {props.name}")
+        print(f"Compute capability: {props.major}.{props.minor}")
+        mem_total = props.total_memory / 1e9
+        mem_free = (props.total_memory - torch.cuda.memory_allocated()) / 1e9
+        print(f"GPU Memory: {mem_total:.1f} GB total, {mem_free:.1f} GB free\n")
     except Exception as e:
         print(f"CUDA initialization failed: {e}")
-        print("This demo requires a CUDA-capable GPU with CuPy installed.")
+        print("This demo requires a CUDA-capable GPU with PyTorch CUDA support.")
         sys.exit(1)
 
     # Run both demos
-    dem_outdoor, cams_outdoor, vis_any_outdoor, vis_count_outdoor = run_outdoor_demo()
+    dem_outdoor, cams_outdoor, vis_any_outdoor, vis_count_outdoor = run_outdoor_demo(1)
     dem_indoor, cams_indoor, vis_any_indoor, vis_count_indoor = run_indoor_demo()
+    dem_outdoor, cams_outdoor, vis_any_outdoor, vis_count_outdoor = run_outdoor_demo(2)
+    dem_outdoor, cams_outdoor, vis_any_outdoor, vis_count_outdoor = run_outdoor_demo(3)
+    dem_indoor, cams_indoor, vis_any_indoor, vis_count_indoor = run_indoor_demo(4)
+    dem_indoor, cams_indoor, vis_any_indoor, vis_count_indoor = run_indoor_demo(5)
 
     # Create combined visualization
     print("\n" + "=" * 60)

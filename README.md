@@ -9,7 +9,7 @@ This module computes visibility maps for multiple cameras viewing a DEM (Digital
 - `visible_any[y,x]` - 1 if **any** camera can see that DEM cell
 - `vis_count[y,x]` - Number of cameras that can see each cell
 
-The computation runs entirely on GPU using a CuPy RawKernel CUDA implementation.
+The computation runs entirely on GPU using a custom CUDA kernel (`.cu` file) compiled via PyTorch's `cpp_extension` JIT system.
 
 ## How It Works
 
@@ -63,8 +63,9 @@ h = h00*(1-fx)*(1-fy) + h10*fx*(1-fy) + h01*(1-fx)*fy + h11*fx*fy
 
 - Python 3.8+
 - CUDA-capable GPU (Compute Capability 3.0+)
-- CUDA Toolkit (11.x, 12.x, or 13.x)
-- NumPy, Matplotlib, CuPy
+- CUDA Toolkit with `nvcc` compiler
+- PyTorch with CUDA support
+- NumPy, Matplotlib
 
 ### Setup
 
@@ -76,28 +77,26 @@ cd tactica-optimization
 python -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies (adjust cupy version to match your CUDA)
-# - CUDA 11.x: pip install cupy-cuda11x
-# - CUDA 12.x: pip install cupy-cuda12x
-# - CUDA 13.x: pip install cupy-cuda13x
+# Install dependencies
 pip install -r requirements.txt
 
 # If CUDA libraries are not in default path, set LD_LIBRARY_PATH
 # Common locations: /usr/local/cuda/lib64, /opt/cuda/lib64
 export LD_LIBRARY_PATH=/opt/cuda/lib64:$LD_LIBRARY_PATH
 
-# Run demo
+# Run demo (first run compiles the CUDA kernel, takes ~30s)
 python demo.py
 ```
 
 ### Verify CUDA Setup
 
 ```bash
-# Check CUDA version
+# Check CUDA compiler
 nvcc --version
 
-# Verify CuPy can access GPU
-python -c "import cupy as cp; print(f'GPU: {cp.cuda.Device().compute_capability}')"
+# Verify PyTorch can access GPU
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
 ```
 
 ## Usage
@@ -193,14 +192,68 @@ visible_any, vis_count = compute_visibility(dem, cameras, wall_threshold=1e6)
 ```
 tactica-optimization/
 ├── src/
-│   └── visibility_gpu.py   # Core GPU engine + utilities
+│   ├── cuda/
+│   │   └── visibility_kernel.cu  # CUDA kernel implementation
+│   └── visibility_gpu.py         # Python interface + utilities
 ├── outputs/
-│   └── demo.png            # Generated visualization
-├── .venv/                  # Python virtual environment
-├── demo.py                 # End-to-end demo script
-├── requirements.txt        # Python dependencies
-└── README.md               # This file
+│   ├── demo.png                  # Demo visualization
+│   ├── optimization_*.gif        # Optimization progress animations
+│   └── convergence_*.png         # Convergence plots
+├── .venv/                        # Python virtual environment
+├── demo.py                       # Visibility demo script
+├── optimize.py                   # CMA-ES optimization script
+├── requirements.txt              # Python dependencies
+└── README.md                     # This file
 ```
+
+## Camera Placement Optimization
+
+The `optimize.py` script uses **CMA-ES** (Covariance Matrix Adaptation Evolution Strategy) to optimize camera positions and orientations for maximum visibility coverage.
+
+### Algorithm: CMA-ES
+
+CMA-ES is a state-of-the-art evolutionary algorithm for continuous optimization:
+- Self-adapting step sizes and covariance structure
+- Handles bounds naturally via repair/penalization
+- Excellent for black-box optimization with 10-100 parameters
+- No gradient information required
+
+### Optimized Parameters (5 per camera)
+
+| Parameter | Description | Bounds |
+|-----------|-------------|--------|
+| x | Grid x position | (margin, width-margin) |
+| y | Grid y position | (margin, height-margin) |
+| z | Height above ground | (1, 25) |
+| yaw (θ) | Horizontal angle | (-π, π) |
+| pitch (φ) | Vertical angle | (-π/3, 0) |
+
+### Running Optimization
+
+```bash
+# Optimize both indoor and outdoor scenarios
+python optimize.py --scenario both --generations 50
+
+# Outdoor only with more generations
+python optimize.py --scenario outdoor --generations 100
+
+# Skip GIF generation for faster runs
+python optimize.py --scenario indoor --skip-gif
+```
+
+### Outputs
+
+- `optimization_outdoor.gif` - Animation of outdoor optimization progress
+- `optimization_indoor.gif` - Animation of indoor optimization progress
+- `convergence_outdoor.png` - Coverage vs generation plot (outdoor)
+- `convergence_indoor.png` - Coverage vs generation plot (indoor)
+
+### Example Results
+
+| Scenario | Cameras | Initial Coverage | Final Coverage | Generations |
+|----------|---------|-----------------|----------------|-------------|
+| Outdoor (512×512) | 6 | ~24% | ~37% | 50 |
+| Indoor (256×256) | 4 | ~30% | ~49% | 50 |
 
 ## Known Limitations
 

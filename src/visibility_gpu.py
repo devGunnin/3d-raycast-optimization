@@ -1,194 +1,107 @@
 """
 GPU-based visibility computation for camera placement optimization.
 
-This module implements a CuPy RawKernel-based CUDA kernel that computes
-per-cell visibility for multiple cameras viewing a DEM (Digital Elevation Model).
+This module provides a Python interface to the CUDA visibility kernel,
+which computes per-cell visibility for multiple cameras viewing a DEM.
 
-Method: Per-cell ray-marching with FOV gating and LOS occlusion sampling.
+The CUDA kernel is JIT-compiled via PyTorch's cpp_extension system.
 """
 
+import os
 import numpy as np
-import cupy as cp
+import torch
+from torch.utils.cpp_extension import load
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 # =============================================================================
-# CUDA Kernel: Visibility computation for all cameras
+# CUDA Extension Loading (JIT Compilation)
 # =============================================================================
 
-VISIBILITY_KERNEL_CODE = r'''
-extern "C" __global__ void compute_visibility(
-    const float* __restrict__ dem,           // DEM heightfield [H, W]
-    const float* __restrict__ cameras,       // Camera params [N, 8]: x,y,z,yaw,pitch,hfov,vfov,range
-    unsigned char* __restrict__ visible_any, // Output: any camera sees this cell [H, W]
-    int* __restrict__ vis_count,             // Output: count of cameras seeing this cell [H, W]
-    int height,                              // DEM height (rows)
-    int width,                               // DEM width (cols)
-    int num_cameras,                         // Number of cameras
-    float wall_threshold,                    // Height threshold for walls (e.g., 1e6)
-    float occlusion_epsilon                  // Epsilon for occlusion test
-) {
-    // Thread index maps to DEM cell (row, col)
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
+_cuda_module = None
 
-    if (row >= height || col >= width) return;
+def _get_cuda_module():
+    """Load and cache the CUDA extension module."""
+    global _cuda_module
+    if _cuda_module is None:
+        cuda_dir = os.path.join(os.path.dirname(__file__), 'cuda')
+        kernel_path = os.path.join(cuda_dir, 'visibility_kernel.cu')
 
-    int cell_idx = row * width + col;
+        if not os.path.exists(kernel_path):
+            raise RuntimeError(f"CUDA kernel not found: {kernel_path}")
 
-    // Get DEM height at this cell
-    float cell_z = dem[cell_idx];
+        print("Compiling CUDA visibility kernel (first run only)...")
+        _cuda_module = load(
+            name='visibility_cuda',
+            sources=[kernel_path],
+            verbose=False,
+            extra_cuda_cflags=['-O3', '--use_fast_math']
+        )
+        print("CUDA kernel compiled successfully.")
 
-    // If this cell is a wall, it cannot be "seen" (it blocks, not receives visibility)
-    if (cell_z >= wall_threshold) {
-        visible_any[cell_idx] = 0;
-        vis_count[cell_idx] = 0;
-        return;
-    }
-
-    // Cell center in world coordinates (x=col, y=row, z=cell_z)
-    float cell_x = (float)col + 0.5f;
-    float cell_y = (float)row + 0.5f;
-
-    int count = 0;
-
-    // Loop over all cameras
-    for (int cam = 0; cam < num_cameras; cam++) {
-        // Unpack camera parameters
-        float cam_x = cameras[cam * 8 + 0];
-        float cam_y = cameras[cam * 8 + 1];
-        float cam_z = cameras[cam * 8 + 2];
-        float cam_yaw = cameras[cam * 8 + 3];     // radians, 0 = +X axis, CCW positive
-        float cam_pitch = cameras[cam * 8 + 4];   // radians, 0 = horizontal, negative = down
-        float cam_hfov = cameras[cam * 8 + 5];    // horizontal FOV in radians
-        float cam_vfov = cameras[cam * 8 + 6];    // vertical FOV in radians
-        float cam_range = cameras[cam * 8 + 7];   // max range
-
-        // Vector from camera to cell
-        float dx = cell_x - cam_x;
-        float dy = cell_y - cam_y;
-        float dz = cell_z - cam_z;
-
-        // Horizontal distance
-        float dist_xy = sqrtf(dx * dx + dy * dy);
-        float dist_3d = sqrtf(dx * dx + dy * dy + dz * dz);
-
-        // =================================================================
-        // Gate 1: Range check
-        // =================================================================
-        if (dist_xy > cam_range || dist_3d < 0.01f) {
-            continue;  // Out of range or too close
-        }
-
-        // =================================================================
-        // Gate 2: Horizontal FOV check
-        // =================================================================
-        // Angle from camera to cell in XY plane
-        float angle_to_cell = atan2f(dy, dx);
-
-        // Angular difference (wrapped to [-pi, pi])
-        float h_diff = angle_to_cell - cam_yaw;
-        // Normalize to [-pi, pi]
-        while (h_diff > 3.14159265f) h_diff -= 2.0f * 3.14159265f;
-        while (h_diff < -3.14159265f) h_diff += 2.0f * 3.14159265f;
-
-        if (fabsf(h_diff) > cam_hfov * 0.5f) {
-            continue;  // Outside horizontal FOV
-        }
-
-        // =================================================================
-        // Gate 3: Vertical FOV check
-        // =================================================================
-        // Vertical angle: positive = up, negative = down
-        // atan2(dz, dist_xy) gives angle from horizontal
-        float v_angle_to_cell = atan2f(dz, dist_xy);
-
-        // Angular difference from camera pitch
-        float v_diff = v_angle_to_cell - cam_pitch;
-
-        if (fabsf(v_diff) > cam_vfov * 0.5f) {
-            continue;  // Outside vertical FOV
-        }
-
-        // =================================================================
-        // Gate 4: Line-of-sight occlusion test via sampling
-        // =================================================================
-        // Sample K points along the ray from camera to cell
-        // K = ceil(dist_xy / step_size), clamped to [8, 512]
-        float step_size = 1.0f;  // ~1 cell per step
-        int K = (int)ceilf(dist_xy / step_size);
-        if (K < 8) K = 8;
-        if (K > 512) K = 512;
-
-        bool occluded = false;
-
-        for (int s = 1; s < K; s++) {  // Start at s=1 to skip camera position
-            float t = (float)s / (float)K;  // Interpolation parameter [0, 1]
-
-            // Sample point along ray
-            float sx = cam_x + t * dx;
-            float sy = cam_y + t * dy;
-            float sz = cam_z + t * dz;  // LOS height at sample point
-
-            // Convert to grid coordinates (0-indexed)
-            float gx = sx - 0.5f;  // Grid x
-            float gy = sy - 0.5f;  // Grid y
-
-            // Clamp to valid grid range for interpolation
-            if (gx < 0.0f) gx = 0.0f;
-            if (gy < 0.0f) gy = 0.0f;
-            if (gx > (float)(width - 1) - 0.001f) gx = (float)(width - 1) - 0.001f;
-            if (gy > (float)(height - 1) - 0.001f) gy = (float)(height - 1) - 0.001f;
-
-            // Bilinear interpolation for DEM height at (gx, gy)
-            int x0 = (int)floorf(gx);
-            int y0 = (int)floorf(gy);
-            int x1 = x0 + 1;
-            int y1 = y0 + 1;
-
-            // Clamp indices
-            if (x1 >= width) x1 = width - 1;
-            if (y1 >= height) y1 = height - 1;
-
-            float fx = gx - (float)x0;
-            float fy = gy - (float)y0;
-
-            // Sample DEM heights at corners
-            float h00 = dem[y0 * width + x0];
-            float h10 = dem[y0 * width + x1];
-            float h01 = dem[y1 * width + x0];
-            float h11 = dem[y1 * width + x1];
-
-            // Bilinear interpolation
-            float h0 = h00 * (1.0f - fx) + h10 * fx;
-            float h1 = h01 * (1.0f - fx) + h11 * fx;
-            float dem_height = h0 * (1.0f - fy) + h1 * fy;
-
-            // Check occlusion: if terrain is above LOS + epsilon, ray is blocked
-            if (dem_height > sz + occlusion_epsilon) {
-                occluded = true;
-                break;
-            }
-        }
-
-        if (!occluded) {
-            count++;
-        }
-    }
-
-    // Write outputs
-    visible_any[cell_idx] = (count > 0) ? 1 : 0;
-    vis_count[cell_idx] = count;
-}
-'''
-
-# Compile the CUDA kernel
-_visibility_kernel = cp.RawKernel(VISIBILITY_KERNEL_CODE, 'compute_visibility')
+    return _cuda_module
 
 
 # =============================================================================
 # Data Structures
 # =============================================================================
+
+@dataclass
+class CameraResolution:
+    """
+    Camera sensor resolution configuration.
+
+    Attributes:
+        horizontal_pixels: Horizontal resolution (e.g., 3840 for 4K)
+        vertical_pixels: Vertical resolution (e.g., 2160 for 4K)
+        pixels_per_meter: Required pixel density at max range (e.g., 50 PPM)
+    """
+    horizontal_pixels: int = 3840  # 4K default
+    vertical_pixels: int = 2160   # 4K default
+    pixels_per_meter: float = 50.0  # Required resolution at max range
+
+    @property
+    def aspect_ratio(self) -> float:
+        """Width / Height aspect ratio."""
+        return self.horizontal_pixels / self.vertical_pixels
+
+
+def compute_max_range_from_fov(
+    hfov: float,
+    vfov: float,
+    resolution: CameraResolution
+) -> float:
+    """
+    Compute maximum viewing range based on FOV and resolution requirements.
+
+    The max range is limited by the required pixels-per-meter (PPM) at the
+    viewing distance. Narrower FOV = longer range, wider FOV = shorter range.
+
+    Math:
+        At distance d, the horizontal width covered is: 2 * d * tan(hfov/2)
+        Pixels per meter at that distance: horizontal_pixels / width
+        Required: pixels_per_meter = horizontal_pixels / (2 * d * tan(hfov/2))
+        Solving for d: d = horizontal_pixels / (2 * ppm * tan(hfov/2))
+
+    Args:
+        hfov: Horizontal field of view in radians.
+        vfov: Vertical field of view in radians.
+        resolution: CameraResolution configuration.
+
+    Returns:
+        Maximum range in grid units (limited by both horizontal and vertical).
+    """
+    ppm = resolution.pixels_per_meter
+
+    # Horizontal range limit
+    h_range = resolution.horizontal_pixels / (2 * ppm * np.tan(hfov / 2))
+
+    # Vertical range limit
+    v_range = resolution.vertical_pixels / (2 * ppm * np.tan(vfov / 2))
+
+    # Take minimum (we need sufficient resolution in both dimensions)
+    return min(h_range, v_range)
+
 
 @dataclass
 class Camera:
@@ -198,7 +111,7 @@ class Camera:
     Attributes:
         x, y, z: Position in world coordinates (grid units)
         yaw: Horizontal viewing direction in radians (0 = +X, CCW positive)
-        pitch: Vertical viewing angle in radians (0 = horizontal, negative = looking down)
+        pitch: Vertical viewing angle in radians (0 = horizontal, negative = down)
         hfov: Horizontal field of view in radians
         vfov: Vertical field of view in radians
         max_range: Maximum viewing distance (horizontal)
@@ -219,6 +132,29 @@ class Camera:
             self.hfov, self.vfov, self.max_range
         ], dtype=np.float32)
 
+    @classmethod
+    def from_fov_and_resolution(
+        cls,
+        x: float, y: float, z: float,
+        yaw: float, pitch: float,
+        hfov: float, vfov: float,
+        resolution: CameraResolution
+    ) -> 'Camera':
+        """
+        Create a Camera with max_range computed from FOV and resolution.
+
+        Args:
+            x, y, z: Position.
+            yaw, pitch: Orientation.
+            hfov, vfov: Field of view in radians.
+            resolution: CameraResolution for computing max_range.
+
+        Returns:
+            Camera instance with computed max_range.
+        """
+        max_range = compute_max_range_from_fov(hfov, vfov, resolution)
+        return cls(x, y, z, yaw, pitch, hfov, vfov, max_range)
+
 
 # =============================================================================
 # Main Visibility Computation
@@ -229,7 +165,6 @@ def compute_visibility(
     cameras: List[Camera],
     wall_threshold: float = 1e6,
     occlusion_epsilon: float = 1e-3,
-    block_size: Tuple[int, int] = (16, 16)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute per-cell visibility from multiple cameras on GPU.
@@ -239,7 +174,6 @@ def compute_visibility(
         cameras: List of Camera objects defining viewer positions and FOV.
         wall_threshold: Height value above which cells are treated as walls.
         occlusion_epsilon: Tolerance for occlusion test (prevents z-fighting).
-        block_size: CUDA block dimensions (threads per block).
 
     Returns:
         visible_any: uint8 array (H, W), 1 if any camera sees the cell.
@@ -250,47 +184,27 @@ def compute_visibility(
     assert len(cameras) > 0, "Must provide at least one camera"
     assert len(cameras) <= 64, f"Maximum 64 cameras supported, got {len(cameras)}"
 
-    height, width = dem.shape
-    num_cameras = len(cameras)
+    # Get CUDA module
+    cuda_module = _get_cuda_module()
 
     # Pack camera parameters into array [N, 8]
     camera_params = np.stack([cam.to_array() for cam in cameras], axis=0)
-    assert camera_params.shape == (num_cameras, 8)
 
-    # Transfer to GPU
-    dem_gpu = cp.asarray(dem.astype(np.float32), dtype=cp.float32)
-    cameras_gpu = cp.asarray(camera_params, dtype=cp.float32)
+    # Transfer to GPU as PyTorch tensors
+    dem_gpu = torch.from_numpy(dem.astype(np.float32)).cuda()
+    cameras_gpu = torch.from_numpy(camera_params).cuda()
 
-    # Allocate output arrays
-    visible_any_gpu = cp.zeros((height, width), dtype=cp.uint8)
-    vis_count_gpu = cp.zeros((height, width), dtype=cp.int32)
-
-    # Compute grid dimensions
-    grid_x = (width + block_size[0] - 1) // block_size[0]
-    grid_y = (height + block_size[1] - 1) // block_size[1]
-
-    # Launch kernel
-    _visibility_kernel(
-        (grid_x, grid_y),           # Grid dimensions
-        block_size,                  # Block dimensions
-        (
-            dem_gpu,
-            cameras_gpu,
-            visible_any_gpu,
-            vis_count_gpu,
-            height,
-            width,
-            num_cameras,
-            np.float32(wall_threshold),
-            np.float32(occlusion_epsilon)
-        )
+    # Call CUDA kernel
+    vis_count_gpu, visible_any_gpu = cuda_module.compute_visibility(
+        dem_gpu,
+        cameras_gpu,
+        wall_threshold,
+        occlusion_epsilon
     )
 
-    # Synchronize and transfer back to CPU
-    cp.cuda.Stream.null.synchronize()
-
-    visible_any = cp.asnumpy(visible_any_gpu)
-    vis_count = cp.asnumpy(vis_count_gpu)
+    # Transfer back to CPU as numpy arrays
+    visible_any = visible_any_gpu.cpu().numpy()
+    vis_count = vis_count_gpu.cpu().numpy()
 
     return visible_any, vis_count
 
