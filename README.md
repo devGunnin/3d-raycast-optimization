@@ -195,22 +195,44 @@ tactica-optimization/
 │   ├── cuda/
 │   │   └── visibility_kernel.cu  # CUDA kernel implementation
 │   └── visibility_gpu.py         # Python interface + utilities
+├── OptimizationFramework/        # Submodule with optimization algorithms
+│   └── src/
+│       └── optimizers/           # PSO, DE, GA, ABC, etc.
 ├── outputs/
 │   ├── demo.png                  # Demo visualization
 │   ├── optimization_*.gif        # Optimization progress animations
-│   └── convergence_*.png         # Convergence plots
+│   ├── convergence_*.png         # Convergence plots
+│   ├── comparison/               # Optimizer comparison outputs
+│   └── benchmark/                # Multi-topology benchmark outputs
 ├── .venv/                        # Python virtual environment
 ├── demo.py                       # Visibility demo script
-├── optimize.py                   # CMA-ES optimization script
+├── optimize.py                   # Multi-optimizer optimization script
+├── compare_optimizers.py         # Compare all optimizers on single scenario
+├── benchmark_topologies.py       # Benchmark across terrain types
 ├── requirements.txt              # Python dependencies
 └── README.md                     # This file
 ```
 
 ## Camera Placement Optimization
 
-The `optimize.py` script uses **CMA-ES** (Covariance Matrix Adaptation Evolution Strategy) to optimize camera positions and orientations for maximum visibility coverage.
+The optimization scripts use various metaheuristic algorithms to optimize camera positions, orientations, and field-of-view for maximum visibility coverage.
 
-### Algorithm: CMA-ES
+### Available Optimizers
+
+The project integrates with **OptimizationFramework** to provide multiple optimization algorithms:
+
+| Optimizer | Description | Script Flag |
+|-----------|-------------|-------------|
+| CMA-ES | Covariance Matrix Adaptation Evolution Strategy | `--optimizer cma` |
+| PSO | Particle Swarm Optimization | `--optimizer pso` |
+| Differential Evolution | Scipy's DE implementation | `--optimizer de` |
+| Genetic Algorithm | GA with SBX crossover | `--optimizer ga` |
+| Artificial Bee Colony | Swarm-based optimization | `--optimizer abc` |
+| Dual Annealing | Global optimization with local search | `--optimizer dual` |
+
+Additional optimizers available in `compare_optimizers.py`: Nelder-Mead, Powell, Beehive (BHO), and PGO.
+
+### Algorithm: CMA-ES (Default)
 
 CMA-ES is a state-of-the-art evolutionary algorithm for continuous optimization:
 - Self-adapting step sizes and covariance structure
@@ -218,7 +240,7 @@ CMA-ES is a state-of-the-art evolutionary algorithm for continuous optimization:
 - Excellent for black-box optimization with 10-100 parameters
 - No gradient information required
 
-### Optimized Parameters (5 per camera)
+### Optimized Parameters (6 per camera)
 
 | Parameter | Description | Bounds |
 |-----------|-------------|--------|
@@ -227,33 +249,59 @@ CMA-ES is a state-of-the-art evolutionary algorithm for continuous optimization:
 | z | Height above ground | (1, 25) |
 | yaw (θ) | Horizontal angle | (-π, π) |
 | pitch (φ) | Vertical angle | (-π/3, 0) |
+| hfov | Horizontal field of view | (20°, 150°) |
+
+**Note:** Vertical FOV (vfov) is automatically derived from hfov using the camera's aspect ratio: `vfov = 2 * arctan(tan(hfov/2) / aspect_ratio)`
 
 ### Running Optimization
 
 ```bash
-# Optimize both indoor and outdoor scenarios
-python optimize.py --scenario both --generations 50
+# Run all scenarios (outdoor, indoor, random) with CMA-ES
+python optimize.py --scenario all --generations 100
 
-# Outdoor only with more generations
-python optimize.py --scenario outdoor --generations 100
+# Outdoor only with PSO optimizer
+python optimize.py --scenario outdoor --optimizer pso --generations 100
+
+# Indoor with specific camera count
+python optimize.py --scenario indoor --cameras 6 --generations 50
 
 # Skip GIF generation for faster runs
 python optimize.py --scenario indoor --skip-gif
+
+# Compare all optimizers on a single scenario
+python compare_optimizers.py --scenario indoor --cameras 4 --budget 1000
+
+# Benchmark across multiple terrain topologies
+python benchmark_topologies.py --cameras 4 --budget 1000
 ```
 
 ### Outputs
 
+**From `optimize.py`:**
 - `optimization_outdoor.gif` - Animation of outdoor optimization progress
 - `optimization_indoor.gif` - Animation of indoor optimization progress
-- `convergence_outdoor.png` - Coverage vs generation plot (outdoor)
-- `convergence_indoor.png` - Coverage vs generation plot (indoor)
+- `optimization_random.gif` - Animation of random terrain optimization
+- `convergence_*.png` - Coverage vs generation plots
+- `final_*.png` - Final camera configuration visualizations
 
-### Example Results
+**From `compare_optimizers.py`:**
+- `outputs/comparison/comparison_all_methods.png` - Bar chart and convergence curves
+- `outputs/comparison/optimization_*.gif` - Per-optimizer progress animations
+- `outputs/comparison/final_*.png` - Final results per optimizer
 
-| Scenario | Cameras | Initial Coverage | Final Coverage | Generations |
-|----------|---------|-----------------|----------------|-------------|
-| Outdoor (512×512) | 6 | ~24% | ~37% | 50 |
-| Indoor (256×256) | 4 | ~30% | ~49% | 50 |
+**From `benchmark_topologies.py`:**
+- `outputs/benchmark/topologies_overview.png` - DEM visualization for all terrain types
+- `outputs/benchmark/comparison_per_topology.png` - Results per terrain type
+- `outputs/benchmark/summary_heatmap.png` - Method vs topology performance matrix
+- `outputs/benchmark/overall_ranking.png` - Average ranking across all topologies
+
+### Terrain Types
+
+| Topology | Description | Use Case |
+|----------|-------------|----------|
+| Realistic (Indoor) | Floorplan with walls and rooms | Security camera placement |
+| Synthetic (Hills) | Gaussian hills and ridges | Outdoor surveillance |
+| Random (Noise) | Perlin-noise terrain | Stress testing optimizers |
 
 ## Known Limitations
 
@@ -269,10 +317,12 @@ python optimize.py --scenario indoor --skip-gif
 
 ## Next Steps (Future Work)
 
-### Step 2: Camera Placement Optimization
-- Gradient-free optimization (CMA-ES, genetic algorithms) over camera parameters
-- Objective: maximize coverage, minimize camera count, ensure redundancy
-- Constraints: camera must be on valid terrain, avoid walls
+### Step 2: Camera Placement Optimization ✅ COMPLETE
+- ✅ Gradient-free optimization (CMA-ES, PSO, DE, GA, ABC, Dual Annealing, etc.)
+- ✅ Objective: maximize coverage with redundancy bonus
+- ✅ Constraints: wall avoidance, bounds penalization
+- ✅ FOV optimization (automatic max range from resolution requirements)
+- ✅ Multi-topology benchmarking
 
 ### Step 3: Modern Frontend Visualization
 - WebGL/Three.js 3D terrain viewer
