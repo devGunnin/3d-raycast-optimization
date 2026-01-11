@@ -36,6 +36,13 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Project outputs (keep demo.png for reference)
-outputs/*.png
-!outputs/demo.png
+# Project outputs (all generated files)
+outputs/
+
+# Frontend (if present)
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+
+examples/outputs/
+benchmarking/outputs/
